@@ -2,6 +2,11 @@
 Análisis de isocronas de centros de salud - versión completa optimizada.
 Identifica redundancia (>50%) y desiertos, genera reporte HTML interactivo.
 
+CORRECCIÓN CRÍTICA v2:
+- El grid/fishnet ya NO se usa para determinar redundancia.
+- Se calculan intersecciones REALES entre isocronas mediante overlay espacial.
+- El grid se conserva ÚNICAMENTE para identificar desiertos.
+
 Requiere: geopandas, shapely, matplotlib, numpy, folium, branca
 """
 
@@ -58,13 +63,17 @@ def create_fishnet(bounds, cell_size_m=10000.0):
 
 def analyze(gdf, cell_size_m=10000.0, redundancy_threshold_pct=50.0, buffer_cells=0):
     """
-    Analiza redundancia y desiertos con un grid.
+    Analiza redundancia y desiertos.
+    CORRECCIÓN: redundancia se calcula con intersecciones reales, no con grid.
     """
     gdf = gdf.copy()
     gdf['_iso_idx'] = range(len(gdf))
     gdf['area_km2'] = gdf.geometry.area / 1e6
     
-    print(f"  Creando grid...")
+    # =====================================================================
+    # 1. GRID — solo para desiertos
+    # =====================================================================
+    print(f"  Creando grid para desiertos...")
     t0 = time.time()
     bounds = list(gdf.total_bounds)
     if buffer_cells > 0:
@@ -73,50 +82,76 @@ def analyze(gdf, cell_size_m=10000.0, redundancy_threshold_pct=50.0, buffer_cell
         bounds[2] += buffer_cells * cell_size_m
         bounds[3] += buffer_cells * cell_size_m
     fishnet = create_fishnet(bounds, cell_size_m=cell_size_m)
-    print(f"    Tiempo: {time.time()-t0:.1f}s")
     
-    print("  Spatial join isocronas-celdas...")
-    t0 = time.time()
-    joined = gpd.sjoin(
+    joined_grid = gpd.sjoin(
         gdf[['_iso_idx', 'clues', 'geometry']],
         fishnet[['cell_id', 'geometry']],
         how='inner', predicate='intersects'
     )
-    print(f"    Pares: {len(joined)}. Tiempo: {time.time()-t0:.1f}s")
-    
-    print("  Contando superposiciones por celda...")
-    t0 = time.time()
-    cell_counts = joined.groupby('cell_id').size().reset_index(name='n_isocronas')
-    joined = joined.merge(cell_counts, on='cell_id', how='left')
-    print(f"    Tiempo: {time.time()-t0:.1f}s")
-    
-    print("  Calculando redundancia...")
-    t0 = time.time()
-    iso_stats = joined.groupby('_iso_idx').agg(
-        total_celdas=('cell_id', 'nunique'),
-        celdas_compartidas=('n_isocronas', lambda x: int((x > 1).sum()))
-    ).reset_index()
-    iso_stats['redundancia_pct'] = (iso_stats['celdas_compartidas'] / iso_stats['total_celdas'] * 100.0).fillna(0)
-    iso_stats['is_redundant'] = iso_stats['redundancia_pct'] >= redundancy_threshold_pct
-    
-    gdf = gdf.merge(iso_stats, on='_iso_idx', how='left')
-    gdf['redundancia_pct'] = gdf['redundancia_pct'].fillna(0)
-    gdf['is_redundant'] = gdf['is_redundant'].fillna(False)
-    print(f"    Tiempo: {time.time()-t0:.1f}s")
-    
-    print("  Identificando desiertos...")
-    t0 = time.time()
-    cells_with_data = set(joined['cell_id'].unique())
+    cells_with_data = set(joined_grid['cell_id'].unique())
     desert_cells = fishnet[~fishnet['cell_id'].isin(cells_with_data)].copy()
     desert_cells['area_km2'] = desert_cells.geometry.area / 1e6
     print(f"    Celdas desierto: {len(desert_cells)}. Tiempo: {time.time()-t0:.1f}s")
     
-    redundancy_df = gdf[['clues', 'area_km2', 'redundancia_pct', 'is_redundant', 'geometry']].copy()
-    redundancy_df = redundancy_df.rename(columns={'redundancia_pct': 'overlap_pct'})
-    redundancy_df['overlapped_area_km2'] = redundancy_df['area_km2'] * redundancy_df['overlap_pct'] / 100.0
-    redundancy_df['neighbor_count'] = 0
+    # =====================================================================
+    # 2. REDUNDANCIA REAL — intersecciones reales entre isocronas
+    # =====================================================================
+    print("  Calculando intersecciones reales para redundancia...")
+    t0 = time.time()
     
-    return redundancy_df, desert_cells, fishnet, joined
+    # Encontrar pares que REALMENTE se intersectan
+    pares = gpd.sjoin(
+        gdf[['_iso_idx', 'geometry']],
+        gdf[['_iso_idx', 'geometry']].rename(columns={'_iso_idx': '_iso_idx_other'}),
+        how='inner', predicate='intersects'
+    )
+    pares = pares[pares['_iso_idx'] != pares['_iso_idx_other']]
+    print(f"    Pares reales: {len(pares)}. Tiempo: {time.time()-t0:.1f}s")
+    
+    print("  Calculando áreas de superposición por isocrona...")
+    t0 = time.time()
+    
+    resultados = []
+    total = len(gdf)
+    for i, row in gdf.iterrows():
+        iso_idx = row['_iso_idx']
+        geom = row.geometry
+        area_total = geom.area
+        
+        vecinos = pares[pares['_iso_idx'] == iso_idx]['_iso_idx_other'].unique()
+        
+        if len(vecinos) == 0:
+            area_superpuesta = 0
+        else:
+            geoms_vecinos = gdf[gdf['_iso_idx'].isin(vecinos)].geometry
+            union_vecinos = geoms_vecinos.unary_union
+            interseccion = geom.intersection(union_vecinos)
+            area_superpuesta = interseccion.area
+        
+        redundancia_pct = (area_superpuesta / area_total * 100.0) if area_total > 0 else 0
+        
+        resultados.append({
+            '_iso_idx': iso_idx,
+            'area_total_m2': area_total,
+            'area_superpuesta_m2': area_superpuesta,
+            'redundancia_pct': redundancia_pct,
+            'is_redundant': redundancia_pct >= redundancy_threshold_pct,
+            'n_vecinos_reales': len(vecinos)
+        })
+        
+        if (i + 1) % 100 == 0 or i == total - 1:
+            print(f"    Procesadas {i+1}/{total} isocronas...")
+    
+    result_df = pd.DataFrame(resultados)
+    gdf = gdf.merge(result_df, on='_iso_idx', how='left')
+    print(f"    Tiempo total: {time.time()-t0:.1f}s")
+    
+    redundancy_df = gdf[['clues', 'area_km2', 'area_total_m2', 'area_superpuesta_m2',
+                         'redundancia_pct', 'is_redundant', 'n_vecinos_reales', 'geometry']].copy()
+    redundancy_df = redundancy_df.rename(columns={'redundancia_pct': 'overlap_pct'})
+    redundancy_df['overlapped_area_km2'] = redundancy_df['area_superpuesta_m2'] / 1e6
+    
+    return redundancy_df, desert_cells, fishnet, joined_grid
 
 
 def generate_static_map(gdf, redundancy_df, desert_gdf, output_dir):
@@ -132,7 +167,7 @@ def generate_static_map(gdf, redundancy_df, desert_gdf, output_dir):
         redundant.plot(ax=ax, color=ALERTA, alpha=0.4, label=f'Redundante (n={len(redundant)})')
     if not non_redundant.empty:
         non_redundant.plot(ax=ax, color=EXITO, alpha=0.2, label=f'No redundante (n={len(non_redundant)})')
-    ax.set_title('Redundancia de áreas de servicio (>50%)', color=TEXTO)
+    ax.set_title('Redundancia de áreas de servicio (>50% superposición REAL)', color=TEXTO)
     ax.legend(); ax.set_axis_off()
     
     ax = axes[1]
@@ -173,12 +208,12 @@ def generate_interactive_report(gdf, redundancy_df, desert_gdf, output_dir, summ
     gdf_wgs['geometry'] = gdf_wgs.geometry.simplify(tolerance=0.01, preserve_topology=False)
     
     folium.GeoJson(
-        gdf_wgs[['clues', 'area_km2', 'overlap_pct', 'is_redundant', 'geometry']],
+        gdf_wgs[['clues', 'area_km2', 'overlap_pct', 'is_redundant', 'n_vecinos_reales', 'geometry']],
         name='Isocronas',
         style_function=style_isocrona,
         tooltip=folium.GeoJsonTooltip(
-            fields=['clues', 'area_km2', 'overlap_pct', 'is_redundant'],
-            aliases=['CLUES:', 'Área (km²):', 'Superposición (%):', 'Redundante:'],
+            fields=['clues', 'area_km2', 'overlap_pct', 'is_redundant', 'n_vecinos_reales'],
+            aliases=['CLUES:', 'Área (km²):', 'Superposición REAL (%):', 'Redundante:', 'Vecinos reales:'],
             localize=True
         ),
         popup=folium.GeoJsonPopup(
@@ -206,12 +241,12 @@ def generate_interactive_report(gdf, redundancy_df, desert_gdf, output_dir, summ
     
     legend_html = f'''
     <div style="position: fixed; 
-                bottom: 50px; left: 50px; width: 280px;
+                bottom: 50px; left: 50px; width: 300px;
                 background-color: white; border: 2px solid {NEGRO};
                 border-radius: 8px; padding: 12px; font-size: 13px;
                 box-shadow: 3px 3px 10px rgba(0,0,0,0.3);
                 z-index: 9999;">
-        <h4 style="margin-top:0; color:{NEGRO};">📊 Resumen del Análisis</h4>
+        <h4 style="margin-top:0; color:{NEGRO};">📊 Resumen (Superposición Real)</h4>
         <b>Total isocronas:</b> {summary['total_isocronas']:,}<br>
         <b>Redundantes (>50%):</b> <span style="color:{ALERTA};">{summary['redundantes']:,} ({summary['pct_redundantes']}%)</span><br>
         <b>No redundantes:</b> <span style="color:{EXITO};">{summary['no_redundantes']:,}</span><br>
@@ -233,7 +268,7 @@ def generate_interactive_report(gdf, redundancy_df, desert_gdf, output_dir, summ
                 border: 2px solid {NEGRO}; border-radius: 8px;
                 padding: 10px 20px; font-size: 16px; font-weight: bold;
                 z-index: 9999; color: {NEGRO};">
-        Análisis de Isocronas de Centros de Salud
+        Análisis de Isocronas (Superposición Real)
     </div>
     '''
     m.get_root().html.add_child(folium.Element(title_html))
@@ -250,10 +285,10 @@ def export_results(redundancy_df, desert_gdf, output_dir):
     """Exporta resultados."""
     os.makedirs(output_dir, exist_ok=True)
     redundancy_df[['clues', 'area_km2', 'overlapped_area_km2', 'overlap_pct',
-                   'is_redundant', 'geometry']].to_file(
+                   'is_redundant', 'n_vecinos_reales', 'geometry']].to_file(
         os.path.join(output_dir, 'redundancia.gpkg'), driver='GPKG')
     redundancy_df[['clues', 'area_km2', 'overlapped_area_km2', 'overlap_pct',
-                   'is_redundant']].to_csv(
+                   'is_redundant', 'n_vecinos_reales']].to_csv(
         os.path.join(output_dir, 'redundancia.csv'), index=False)
     if not desert_gdf.empty:
         desert_gdf.to_file(os.path.join(output_dir, 'desiertos.gpkg'), driver='GPKG')
@@ -284,7 +319,7 @@ def generate_summary(redundancy_df, desert_gdf, output_dir):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Análisis completo de isocronas con reporte interactivo')
+    parser = argparse.ArgumentParser(description='Análisis completo de isocronas con intersecciones reales')
     parser.add_argument('input', help='Ruta al archivo GeoPackage de isocronas')
     parser.add_argument('-o', '--output', default='resultados_completos', help='Directorio de salida')
     parser.add_argument('--threshold', type=float, default=50.0,
@@ -306,7 +341,7 @@ def main():
         print(f"  Simplificado en {time.time()-t0:.1f}s")
     
     t0 = time.time()
-    print(f"\n[1/3] Analizando redundancia y desiertos con grid de {args.cell_size/1000:.0f}km...")
+    print(f"\n[1/3] Analizando redundancia y desiertos con intersecciones reales...")
     redundancy_df, desert_gdf, fishnet, joined = analyze(
         gdf, cell_size_m=args.cell_size, redundancy_threshold_pct=args.threshold)
     print(f"  Análisis completado en {time.time()-t0:.1f}s")

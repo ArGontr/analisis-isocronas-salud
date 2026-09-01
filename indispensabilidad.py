@@ -1,9 +1,10 @@
 """
 Análisis de isocronas: identificación de isocronas clave/indispensables.
 
-Una isocrona es "clave" si cubre áreas que NINGUNA otra isocrona cubre.
-Es decir: para cada celda del grid, contamos cuántas isocronas la intersectan.
-Las celdas con conteo == 1 son áreas de cobertura exclusiva.
+CORRECCIÓN CRÍTICA v2:
+- El grid/fishnet ya NO se usa para determinar redundancia o indispensabilidad.
+- Se calculan intersecciones REALES entre isocronas mediante overlay espacial.
+- El grid se conserva ÚNICAMENTE para identificar desiertos (celdas sin cobertura).
 
 Requiere: geopandas, shapely, matplotlib, numpy, folium, branca
 """
@@ -55,70 +56,126 @@ def create_fishnet(bounds, cell_size_m=10000.0):
     return gpd.GeoDataFrame({'cell_id': ids, 'geometry': polygons}, crs='EPSG:8858')
 
 
-def analyze_key_isocronas(gdf, cell_size_m=10000.0):
+def calcular_indispensabilidad_real(gdf, cell_size_m=10000.0):
     """
-    Analiza qué isocronas son clave/indispensables.
+    Analiza qué isocronas son clave/indispensables usando intersecciones REALES.
+    
+    El grid solo se usa para desiertos. Para indispensabilidad se usa overlay espacial.
     """
     gdf = gdf.copy()
     gdf['_iso_idx'] = range(len(gdf))
     gdf['area_km2'] = gdf.geometry.area / 1e6
     
-    print(f"  Creando grid...")
+    # =====================================================================
+    # 1. GRID — solo para desiertos (celdas sin cobertura)
+    # =====================================================================
+    print(f"  Creando grid para desiertos...")
     t0 = time.time()
     fishnet = create_fishnet(gdf.total_bounds, cell_size_m=cell_size_m)
-    print(f"    Tiempo: {time.time()-t0:.1f}s")
     
-    print("  Spatial join isocronas-celdas...")
-    t0 = time.time()
-    joined = gpd.sjoin(
+    joined_grid = gpd.sjoin(
         gdf[['_iso_idx', 'clues', 'geometry']],
         fishnet[['cell_id', 'geometry']],
         how='inner', predicate='intersects'
     )
-    print(f"    Pares: {len(joined)}. Tiempo: {time.time()-t0:.1f}s")
+    cells_with_data = set(joined_grid['cell_id'].unique())
+    desert_cells = fishnet[~fishnet['cell_id'].isin(cells_with_data)].copy()
+    desert_cells['area_km2'] = desert_cells.geometry.area / 1e6
+    print(f"    Celdas desierto: {len(desert_cells)}. Tiempo: {time.time()-t0:.1f}s")
     
-    print("  Contando isocronas por celda...")
+    # =====================================================================
+    # 2. INDISPENSABILIDAD REAL — overlay entre isocronas
+    # =====================================================================
+    print("  Calculando intersecciones reales entre isocronas...")
     t0 = time.time()
-    cell_counts = joined.groupby('cell_id').size().reset_index(name='n_isocronas')
-    joined = joined.merge(cell_counts, on='cell_id', how='left')
-    print(f"    Tiempo: {time.time()-t0:.1f}s")
     
-    print("  Identificando celdas de cobertura exclusiva...")
+    # Encontrar pares de isocronas que REALMENTE se intersectan
+    pares = gpd.sjoin(
+        gdf[['_iso_idx', 'geometry']],
+        gdf[['_iso_idx', 'geometry']].rename(columns={'_iso_idx': '_iso_idx_other'}),
+        how='inner', predicate='intersects'
+    )
+    # Eliminar auto-intersecciones
+    pares = pares[pares['_iso_idx'] != pares['_iso_idx_other']]
+    print(f"    Pares que se intersectan realmente: {len(pares)}. Tiempo: {time.time()-t0:.1f}s")
+    
+    # Para cada isocrona, calcular área superpuesta con otras isocronas
+    print("  Calculando áreas de superposición real...")
     t0 = time.time()
     
-    iso_stats = joined.groupby('_iso_idx').agg(
-        total_celdas=('cell_id', 'nunique'),
-        celdas_exclusivas=('n_isocronas', lambda x: int((x == 1).sum()))
-    ).reset_index()
+    # Preparar resultado
+    resultados = []
+    total = len(gdf)
     
-    iso_stats['pct_exclusiva'] = (iso_stats['celdas_exclusivas'] / iso_stats['total_celdas'] * 100.0).fillna(0)
-    iso_stats['is_key'] = iso_stats['celdas_exclusivas'] > 0
-    iso_stats['area_exclusiva_km2'] = iso_stats['celdas_exclusivas'] * (cell_size_m / 1000) ** 2
+    for i, row in gdf.iterrows():
+        iso_idx = row['_iso_idx']
+        geom = row.geometry
+        area_total = geom.area
+        
+        # Encontrar vecinos reales de esta isocrona
+        vecinos = pares[pares['_iso_idx'] == iso_idx]['_iso_idx_other'].unique()
+        
+        if len(vecinos) == 0:
+            # Sin vecinos reales: TODA el área es exclusiva
+            area_exclusiva = area_total
+            area_superpuesta = 0
+        else:
+            # Unir geometrías de vecinos reales
+            geoms_vecinos = gdf[gdf['_iso_idx'].isin(vecinos)].geometry
+            union_vecinos = geoms_vecinos.unary_union
+            
+            # Área exclusiva = isocrona - unión de vecinos
+            exclusive = geom.difference(union_vecinos)
+            area_exclusiva = exclusive.area
+            area_superpuesta = area_total - area_exclusiva
+        
+        resultados.append({
+            '_iso_idx': iso_idx,
+            'area_total_m2': area_total,
+            'area_exclusiva_m2': area_exclusiva,
+            'area_superpuesta_m2': area_superpuesta,
+            'pct_exclusiva': (area_exclusiva / area_total * 100.0) if area_total > 0 else 0,
+            'is_key': area_exclusiva > 0,
+            'n_vecinos_reales': len(vecinos)
+        })
+        
+        if (i + 1) % 100 == 0 or i == total - 1:
+            print(f"    Procesadas {i+1}/{total} isocronas...")
     
-    gdf = gdf.merge(iso_stats, on='_iso_idx', how='left')
-    gdf['pct_exclusiva'] = gdf['pct_exclusiva'].fillna(0)
-    gdf['is_key'] = gdf['is_key'].fillna(False)
-    gdf['celdas_exclusivas'] = gdf['celdas_exclusivas'].fillna(0).astype(int)
-    gdf['area_exclusiva_km2'] = gdf['area_exclusiva_km2'].fillna(0)
-    print(f"    Tiempo: {time.time()-t0:.1f}s")
+    result_df = pd.DataFrame(resultados)
+    gdf = gdf.merge(result_df, on='_iso_idx', how='left')
+    print(f"    Tiempo total: {time.time()-t0:.1f}s")
     
-    print("  Identificando zonas vulnerables (celdas con cobertura única)...")
+    # =====================================================================
+    # 3. Zonas vulnerables: celdas del grid cubiertas por UNA SOLA isocrona
+    #    CORRECCIÓN: verificar que solo una isocrona REALMENTE intersecta la celda
+    # =====================================================================
+    print("  Identificando zonas vulnerables (cobertura única REAL)...")
     t0 = time.time()
-    exclusive_cells = joined[joined['n_isocronas'] == 1]['cell_id'].unique()
-    vulnerable_cells = fishnet[fishnet['cell_id'].isin(exclusive_cells)].copy()
+    
+    # Para cada celda con datos, contar isocronas que REALMENTE la intersectan
+    cell_real_counts = joined_grid.groupby('cell_id')['_iso_idx'].nunique().reset_index(name='n_isocronas_real')
+    
+    # Celdas vulnerables = las que solo 1 isocrona intersecta realmente
+    vulnerable_cells_ids = cell_real_counts[cell_real_counts['n_isocronas_real'] == 1]['cell_id']
+    vulnerable_cells = fishnet[fishnet['cell_id'].isin(vulnerable_cells_ids)].copy()
     vulnerable_cells['area_km2'] = vulnerable_cells.geometry.area / 1e6
-    vulnerable_joined = joined[joined['n_isocronas'] == 1][['cell_id', 'clues']].drop_duplicates()
+    
+    # Merge con clues responsable
+    vulnerable_joined = joined_grid[joined_grid['cell_id'].isin(vulnerable_cells_ids)][['cell_id', 'clues']].drop_duplicates()
     vulnerable_cells = vulnerable_cells.merge(vulnerable_joined, on='cell_id', how='left')
+    
     print(f"    Celdas vulnerables: {len(vulnerable_cells)}. Tiempo: {time.time()-t0:.1f}s")
     
-    high_redundancy_cells = joined[joined['n_isocronas'] >= 5]['cell_id'].unique()
-    high_red = fishnet[fishnet['cell_id'].isin(high_redundancy_cells)].copy()
+    # Zonas de alta redundancia: celdas con ≥5 isocronas reales
+    high_red_ids = cell_real_counts[cell_real_counts['n_isocronas_real'] >= 5]['cell_id']
+    high_red = fishnet[fishnet['cell_id'].isin(high_red_ids)].copy()
     high_red['area_km2'] = high_red.geometry.area / 1e6
     
-    key_df = gdf[['clues', 'area_km2', 'total_celdas', 'celdas_exclusivas', 
-                  'pct_exclusiva', 'area_exclusiva_km2', 'is_key', 'geometry']].copy()
+    key_df = gdf[['clues', 'area_km2', 'area_total_m2', 'area_exclusiva_m2',
+                  'area_superpuesta_m2', 'pct_exclusiva', 'is_key', 'n_vecinos_reales', 'geometry']].copy()
     
-    return key_df, vulnerable_cells, high_red, fishnet, joined
+    return key_df, vulnerable_cells, high_red, fishnet, desert_cells
 
 
 def generate_static_map(gdf, key_df, vulnerable_gdf, output_dir):
@@ -134,7 +191,7 @@ def generate_static_map(gdf, key_df, vulnerable_gdf, output_dir):
         key.plot(ax=ax, color=ALERTA, alpha=0.5, label=f'Clave (n={len(key)})')
     if not non_key.empty:
         non_key.plot(ax=ax, color=NEUTRO, alpha=0.2, label=f'Redundante (n={len(non_key)})')
-    ax.set_title('Isocronas clave (tienen cobertura exclusiva)', color=TEXTO)
+    ax.set_title('Isocronas clave (tienen cobertura exclusiva REAL)', color=TEXTO)
     ax.legend(); ax.set_axis_off()
     
     ax = axes[1]
@@ -151,7 +208,7 @@ def generate_static_map(gdf, key_df, vulnerable_gdf, output_dir):
     print(f"  Mapa estático guardado en: {out_path}")
 
 
-def generate_interactive_report(key_df, vulnerable_gdf, high_red, output_dir, summary):
+def generate_interactive_report(key_df, vulnerable_gdf, high_red, desert_cells, output_dir, summary):
     """Genera reporte HTML interactivo con folium."""
     os.makedirs(output_dir, exist_ok=True)
     
@@ -159,6 +216,7 @@ def generate_interactive_report(key_df, vulnerable_gdf, high_red, output_dir, su
     key_wgs = key_df.to_crs('EPSG:4326')
     vuln_wgs = vulnerable_gdf.to_crs('EPSG:4326') if not vulnerable_gdf.empty else gpd.GeoDataFrame(crs='EPSG:4326')
     high_wgs = high_red.to_crs('EPSG:4326') if not high_red.empty else gpd.GeoDataFrame(crs='EPSG:4326')
+    desert_wgs = desert_cells.to_crs('EPSG:4326') if not desert_cells.empty else gpd.GeoDataFrame(crs='EPSG:4326')
     
     center = [key_wgs.geometry.centroid.y.mean(), key_wgs.geometry.centroid.x.mean()]
     m = folium.Map(location=center, zoom_start=6, tiles='OpenStreetMap')
@@ -180,12 +238,12 @@ def generate_interactive_report(key_df, vulnerable_gdf, high_red, output_dir, su
     key_wgs['geometry'] = key_wgs.geometry.simplify(tolerance=0.01, preserve_topology=False)
     
     folium.GeoJson(
-        key_wgs[['clues', 'area_km2', 'pct_exclusiva', 'celdas_exclusivas', 'area_exclusiva_km2', 'is_key', 'geometry']],
+        key_wgs[['clues', 'area_km2', 'pct_exclusiva', 'area_exclusiva_m2', 'area_superpuesta_m2', 'is_key', 'geometry']],
         name='Isocronas (por indispensabilidad)',
         style_function=style_isocrona,
         tooltip=folium.GeoJsonTooltip(
-            fields=['clues', 'area_km2', 'pct_exclusiva', 'celdas_exclusivas', 'area_exclusiva_km2', 'is_key'],
-            aliases=['CLUES:', 'Área (km²):', '% Exclusiva:', 'Celdas exclusivas:', 'Área exclusiva (km²):', 'Es clave:'],
+            fields=['clues', 'area_km2', 'pct_exclusiva', 'area_exclusiva_m2', 'area_superpuesta_m2', 'is_key'],
+            aliases=['CLUES:', 'Área (km²):', '% Exclusiva:', 'Área exclusiva (km²):', 'Área superpuesta (km²):', 'Es clave:'],
             localize=True
         ),
     ).add_to(m)
@@ -195,7 +253,7 @@ def generate_interactive_report(key_df, vulnerable_gdf, high_red, output_dir, su
         vuln_wgs['geometry'] = vuln_wgs.geometry.simplify(tolerance=0.01, preserve_topology=False)
         folium.GeoJson(
             vuln_wgs[['cell_id', 'clues', 'area_km2', 'geometry']],
-            name='Zonas vulnerables (solo 1 isocrona)',
+            name='Zonas vulnerables (solo 1 isocrona real)',
             style_function=lambda f: {
                 'fillColor': ALERTA,
                 'color': BORGONA_OSCURO,
@@ -212,7 +270,7 @@ def generate_interactive_report(key_df, vulnerable_gdf, high_red, output_dir, su
         high_wgs['geometry'] = high_wgs.geometry.simplify(tolerance=0.01, preserve_topology=False)
         folium.GeoJson(
             high_wgs[['cell_id', 'area_km2', 'geometry']],
-            name='Alta redundancia (≥5 isocronas)',
+            name='Alta redundancia (≥5 isocronas reales)',
             style_function=lambda f: {
                 'fillColor': VERDE_OSCURO,
                 'color': VERDE_PETROLEO,
@@ -224,26 +282,43 @@ def generate_interactive_report(key_df, vulnerable_gdf, high_red, output_dir, su
             show=False
         ).add_to(m)
     
+    if not desert_wgs.empty:
+        print("  Agregando capa de desiertos...")
+        desert_wgs['geometry'] = desert_wgs.geometry.simplify(tolerance=0.01, preserve_topology=False)
+        folium.GeoJson(
+            desert_wgs[['cell_id', 'area_km2', 'geometry']],
+            name='Desiertos de atención',
+            style_function=lambda f: {
+                'fillColor': AMARILLO_PRECAUCION,
+                'color': AMARILLO_MOSTAZA,
+                'weight': 0.5,
+                'fillOpacity': 0.5,
+            },
+            tooltip=folium.GeoJsonTooltip(fields=['cell_id', 'area_km2'],
+                                          aliases=['Celda:', 'Área (km²):']),
+            show=False
+        ).add_to(m)
+    
     legend_html = f'''
     <div style="position: fixed; 
-                bottom: 50px; left: 50px; width: 320px;
+                bottom: 50px; left: 50px; width: 340px;
                 background-color: white; border: 2px solid {NEGRO};
                 border-radius: 8px; padding: 12px; font-size: 13px;
                 box-shadow: 3px 3px 10px rgba(0,0,0,0.3);
                 z-index: 9999;">
-        <h4 style="margin-top:0; color:{NEGRO};">🔑 Indispensabilidad</h4>
+        <h4 style="margin-top:0; color:{NEGRO};">🔑 Indispensabilidad (Intersecciones Reales)</h4>
         <b>Total isocronas:</b> {summary['total_isocronas']:,}<br>
         <b>Isocronas clave:</b> <span style="color:{BORGONA_OSCURO};">{summary['isocronas_clave']:,} ({summary['pct_clave']}%)</span><br>
         <b>Redundantes:</b> <span style="color:{NEUTRO};">{summary['isocronas_redundantes']:,}</span><br>
         <b>Zonas vulnerables:</b> {summary['zonas_vulnerables']:,} celdas<br>
         <b>Área vulnerable:</b> {summary['area_vulnerable_km2']:,.0f} km²<br>
-        <b>Alta redundancia:</b> {summary['zonas_alta_redundancia']:,} celdas<br>
+        <b>Desiertos:</b> {summary['zonas_desiertos']:,} celdas<br>
         <hr style="margin:8px 0;">
         <span style="display:inline-block;width:12px;height:12px;background:{BORGONA_OSCURO};opacity:0.6;"></span> Clave (≥50% exclusiva)<br>
         <span style="display:inline-block;width:12px;height:12px;background:{VINO};opacity:0.6;"></span> Clave (25-50% exclusiva)<br>
         <span style="display:inline-block;width:12px;height:12px;background:{AMARILLO_PRECAUCION};opacity:0.6;"></span> Clave (&lt;25% exclusiva)<br>
-        <span style="display:inline-block;width:12px;height:12px;background:{ALERTA};opacity:0.6;"></span> Zona vulnerable (solo 1 isocrona)<br>
-        <span style="display:inline-block;width:12px;height:12px;background:{VERDE_OSCURO};opacity:0.6;"></span> Alta redundancia (≥5 isocronas)<br>
+        <span style="display:inline-block;width:12px;height:12px;background:{ALERTA};opacity:0.6;"></span> Zona vulnerable (1 isocrona real)<br>
+        <span style="display:inline-block;width:12px;height:12px;background:{AMARILLO_PRECAUCION};opacity:0.6;"></span> Desierto (sin cobertura)<br>
         <span style="display:inline-block;width:12px;height:12px;background:{GRIS};opacity:0.6;"></span> Redundante (0% exclusiva)
     </div>
     '''
@@ -256,7 +331,7 @@ def generate_interactive_report(key_df, vulnerable_gdf, high_red, output_dir, su
                 border: 2px solid {NEGRO}; border-radius: 8px;
                 padding: 10px 20px; font-size: 16px; font-weight: bold;
                 z-index: 9999; color: {NEGRO};">
-        Isocronas Clave / Indispensables
+        Isocronas Clave / Indispensables (Intersecciones Reales)
     </div>
     '''
     m.get_root().html.add_child(folium.Element(title_html))
@@ -272,11 +347,11 @@ def generate_interactive_report(key_df, vulnerable_gdf, high_red, output_dir, su
 def export_results(key_df, vulnerable_gdf, output_dir):
     """Exporta resultados."""
     os.makedirs(output_dir, exist_ok=True)
-    key_df[['clues', 'area_km2', 'total_celdas', 'celdas_exclusivas', 
-            'pct_exclusiva', 'area_exclusiva_km2', 'is_key', 'geometry']].to_file(
+    key_df[['clues', 'area_km2', 'area_total_m2', 'area_exclusiva_m2', 
+            'area_superpuesta_m2', 'pct_exclusiva', 'is_key', 'n_vecinos_reales', 'geometry']].to_file(
         os.path.join(output_dir, 'indispensabilidad.gpkg'), driver='GPKG')
-    key_df[['clues', 'area_km2', 'total_celdas', 'celdas_exclusivas', 
-            'pct_exclusiva', 'area_exclusiva_km2', 'is_key']].to_csv(
+    key_df[['clues', 'area_km2', 'area_total_m2', 'area_exclusiva_m2', 
+            'area_superpuesta_m2', 'pct_exclusiva', 'is_key', 'n_vecinos_reales']].to_csv(
         os.path.join(output_dir, 'indispensabilidad.csv'), index=False)
     if not vulnerable_gdf.empty:
         vulnerable_gdf.to_file(os.path.join(output_dir, 'zonas_vulnerables.gpkg'), driver='GPKG')
@@ -284,7 +359,7 @@ def export_results(key_df, vulnerable_gdf, output_dir):
             os.path.join(output_dir, 'zonas_vulnerables.csv'), index=False)
 
 
-def generate_summary(key_df, vulnerable_gdf, high_red, output_dir):
+def generate_summary(key_df, vulnerable_gdf, high_red, desert_cells, output_dir):
     """Genera resumen JSON."""
     total = len(key_df)
     key_count = int(key_df['is_key'].sum())
@@ -298,25 +373,27 @@ def generate_summary(key_df, vulnerable_gdf, high_red, output_dir):
         'zonas_vulnerables': len(vulnerable_gdf),
         'area_vulnerable_km2': round(float(vulnerable_gdf['area_km2'].sum()), 2) if not vulnerable_gdf.empty else 0.0,
         'zonas_alta_redundancia': len(high_red),
+        'zonas_desiertos': len(desert_cells),
+        'area_desiertos_km2': round(float(desert_cells['area_km2'].sum()), 2) if not desert_cells.empty else 0.0,
         'promedio_pct_exclusiva': round(float(key_df['pct_exclusiva'].mean()), 2),
         'max_pct_exclusiva': round(float(key_df['pct_exclusiva'].max()), 2),
-        'top_10_clave': key_df.nlargest(10, 'pct_exclusiva')[['clues', 'pct_exclusiva', 'area_exclusiva_km2']].to_dict('records')
+        'top_10_clave': key_df.nlargest(10, 'pct_exclusiva')[['clues', 'pct_exclusiva', 'area_exclusiva_m2']].to_dict('records')
     }
     path = os.path.join(output_dir, 'resumen_indispensabilidad.json')
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
-    print("\n=== RESUMEN DE INDISPENSABILIDAD ===")
+    print("\n=== RESUMEN DE INDISPENSABILIDAD (REAL) ===")
     for k, v in summary.items():
         if k != 'top_10_clave':
             print(f"  {k}: {v}")
     print(f"\n  Top 10 isocronas más clave:")
     for i, row in enumerate(summary['top_10_clave'], 1):
-        print(f"    {i}. {row['clues']} — {row['pct_exclusiva']}% exclusiva ({row['area_exclusiva_km2']:,.0f} km²)")
+        print(f"    {i}. {row['clues']} — {row['pct_exclusiva']:.1f}% exclusiva ({row['area_exclusiva_m2']:,.0f} m²)")
     return summary
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Análisis de isocronas clave/indispensables')
+    parser = argparse.ArgumentParser(description='Análisis de isocronas clave/indispensables (intersecciones reales)')
     parser.add_argument('input', help='Ruta al archivo GeoPackage de isocronas')
     parser.add_argument('-o', '--output', default='indispensabilidad', help='Directorio de salida')
     parser.add_argument('--cell-size', type=float, default=10000.0,
@@ -336,18 +413,18 @@ def main():
         print(f"  Simplificado en {time.time()-t0:.1f}s")
     
     t0 = time.time()
-    print(f"\n[1/3] Analizando indispensabilidad con grid de {args.cell_size/1000:.0f}km...")
-    key_df, vulnerable_gdf, high_red, fishnet, joined = analyze_key_isocronas(
+    print(f"\n[1/3] Analizando indispensabilidad con intersecciones reales...")
+    key_df, vulnerable_gdf, high_red, fishnet, desert_cells = calcular_indispensabilidad_real(
         gdf, cell_size_m=args.cell_size)
     print(f"  Análisis completado en {time.time()-t0:.1f}s")
     
     print("\n[2/3] Exportando resultados y generando mapa estático...")
     export_results(key_df, vulnerable_gdf, args.output)
     generate_static_map(gdf, key_df, vulnerable_gdf, args.output)
-    summary = generate_summary(key_df, vulnerable_gdf, high_red, args.output)
+    summary = generate_summary(key_df, vulnerable_gdf, high_red, desert_cells, args.output)
     
     print("\n[3/3] Generando reporte interactivo HTML...")
-    generate_interactive_report(key_df, vulnerable_gdf, high_red, args.output, summary)
+    generate_interactive_report(key_df, vulnerable_gdf, high_red, desert_cells, args.output, summary)
     
     print("\n✅ Análisis de indispensabilidad completado.")
 

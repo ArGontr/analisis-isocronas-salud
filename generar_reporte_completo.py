@@ -1,8 +1,8 @@
 """
 Genera un reporte HTML completo que integra:
-- Análisis de CLUES existentes (indispensabilidad, categorización)
-- Análisis de casas de salud (estrategicas vs redundantees)
-- Énfasis en las 653 casas de salud con CLUES asignada
+- Analisis de CLUES existentes (indispensabilidad, categorizacion)
+- Analisis de casas de salud (estrategicas vs redundantees) v2: intersecciones reales
+- Enfasis en las 653 casas de salud con CLUES asignada
 """
 
 import pandas as pd
@@ -17,10 +17,9 @@ print("Cargando datos...")
 
 # CLUES
 clues = pd.read_csv('resultados_indispensabilidad/base_clues_normalizada.csv')
-# Filtrar DESCONOCIDA para tablas y gráficos
 clues = clues[clues['institucion'] != 'DESCONOCIDA']
 
-# Casas de salud
+# Casas de salud (v2: intersecciones reales)
 casas = pd.read_csv('resultados_casas_salud/casas_salud_clasificadas.csv')
 
 # Cruzar con CLUES asignadas
@@ -28,7 +27,6 @@ cruce = pd.read_excel(r'C:\Users\armando.gonzalez\Downloads\CSUS_CRUCE.xlsx')
 casas_full = casas.merge(cruce[['ID_TEMP_SUS', 'CLUES_ASIGNADA', 'ENTIDAD', 'MUNICIPIO', 'NOMBRE']], 
                           left_on='ID_TEMP_SUS', right_on='ID_TEMP_SUS', how='left')
 
-# Extraer estado del ID_TEMP_SUS (primeros 2-3 caracteres antes del guion)
 casas_full['estado'] = casas_full['ID_TEMP_SUS'].str.split('-').str[0]
 
 print(f"CLUES: {len(clues)}")
@@ -36,7 +34,7 @@ print(f"Casas de salud: {len(casas_full)}")
 print(f"Casas con CLUES asignada: {casas_full['CLUES_ASIGNADA'].notna().sum()}")
 
 # ============================================================
-# GRÁFICOS
+# GRAFICOS
 # ============================================================
 
 def fig_to_base64(fig):
@@ -47,70 +45,71 @@ def fig_to_base64(fig):
     plt.close(fig)
     return img
 
-print("\nGenerando gráficos...")
+print("\nGenerando graficos...")
 
-# Gráfico 1: CLUES por categoría
+# Grafico 1: CLUES por categoria
 fig1, ax1 = plt.subplots(figsize=(8, 5))
 clues_counts = clues['categoria'].value_counts()
 ax1.bar(clues_counts.index, clues_counts.values, color=[EXITO, PRIMARIO, ALERTA])
-ax1.set_title('CLUES por categoría', fontsize=14, fontweight='bold', color=TEXTO)
-ax1.set_ylabel('Número de CLUES', color=TEXTO)
+ax1.set_title('CLUES por categoria', fontsize=14, fontweight='bold', color=TEXTO)
+ax1.set_ylabel('Numero de CLUES', color=TEXTO)
 ax1.tick_params(colors=TEXTO)
 for i, v in enumerate(clues_counts.values):
     ax1.text(i, v + 50, f'{v:,}', ha='center', fontweight='bold')
 img1 = fig_to_base64(fig1)
 
-# Gráfico 2: CLUES por institución y categoría
+# Grafico 2: CLUES por institucion y categoria
 fig2, ax2 = plt.subplots(figsize=(8, 5))
 clues_inst = clues.groupby(['institucion', 'categoria']).size().unstack(fill_value=0)
 clues_inst.plot(kind='bar', ax=ax2, color=[EXITO, PRIMARIO, ALERTA])
-ax2.set_title('CLUES por institución y categoría', fontsize=14, fontweight='bold', color=TEXTO)
-ax2.set_ylabel('Número de CLUES', color=TEXTO)
-ax2.legend(title='Categoría')
+ax2.set_title('CLUES por institucion y categoria', fontsize=14, fontweight='bold', color=TEXTO)
+ax2.set_ylabel('Numero de CLUES', color=TEXTO)
+ax2.legend(title='Categoria')
 ax2.tick_params(axis='x', rotation=0, colors=TEXTO)
 img2 = fig_to_base64(fig2)
 
-# Gráfico 3: Casas de salud por tipo
+# Grafico 3: Casas de salud por tipo (v2)
 fig3, ax3 = plt.subplots(figsize=(8, 5))
 casas_counts = casas_full['tipo'].value_counts()
-ax3.bar(casas_counts.index, casas_counts.values, color=[EXITO, NEUTRO])
-ax3.set_title('Casas de salud por tipo', fontsize=14, fontweight='bold', color=TEXTO)
-ax3.set_ylabel('Número de casas', color=TEXTO)
+colores_tipo = [EXITO if t == 'estrategica' else (NEUTRO if t == 'redundante' else NARANJA) for t in casas_counts.index]
+ax3.bar(casas_counts.index, casas_counts.values, color=colores_tipo)
+ax3.set_title('Casas de salud por tipo (interseccion real)', fontsize=14, fontweight='bold', color=TEXTO)
+ax3.set_ylabel('Numero de casas', color=TEXTO)
 ax3.tick_params(colors=TEXTO)
 for i, v in enumerate(casas_counts.values):
     ax3.text(i, v + 50, f'{v:,}', ha='center', fontweight='bold')
 img3 = fig_to_base64(fig3)
 
-# Gráfico 4: Las 653 con CLUES asignada - estratégicas vs redundantes
+# Grafico 4: Las 653 con CLUES asignada
 con_clues = casas_full[casas_full['CLUES_ASIGNADA'].notna()]
 fig4, ax4 = plt.subplots(figsize=(8, 5))
 con_clues_counts = con_clues['tipo'].value_counts()
 ax4.bar(con_clues_counts.index, con_clues_counts.values, color=[EXITO, NEUTRO])
 ax4.set_title('Casas de salud con CLUES asignada (n=653)', fontsize=14, fontweight='bold', color=TEXTO)
-ax4.set_ylabel('Número de casas', color=TEXTO)
+ax4.set_ylabel('Numero de casas', color=TEXTO)
 ax4.tick_params(colors=TEXTO)
 for i, v in enumerate(con_clues_counts.values):
     ax4.text(i, v + 5, f'{v:,}', ha='center', fontweight='bold')
 img4 = fig_to_base64(fig4)
 
-# Gráfico 5: Top estados con casas estratégicas con CLUES
+# Grafico 5: Top estados con casas estrategicas con CLUES
 fig5, ax5 = plt.subplots(figsize=(10, 6))
 estrat_con_clues = con_clues[con_clues['tipo'] == 'estrategica']
 top_estados = estrat_con_clues['estado'].value_counts().head(10)
 ax5.barh(top_estados.index, top_estados.values, color=EXITO)
-ax5.set_title('Top 10 estados con casas estratégicas con CLUES asignada', fontsize=14, fontweight='bold', color=TEXTO)
-ax5.set_xlabel('Número de casas', color=TEXTO)
+ax5.set_title('Top 10 estados con casas estrategicas con CLUES asignada', fontsize=14, fontweight='bold', color=TEXTO)
+ax5.set_xlabel('Numero de casas', color=TEXTO)
 ax5.tick_params(colors=TEXTO)
 for i, v in enumerate(top_estados.values):
     ax5.text(v + 1, i, f'{v}', va='center', fontweight='bold')
 img5 = fig_to_base64(fig5)
 
-# Tabla: CLUES que tienen casas de salud asignadas estratégicas
+# Tabla: CLUES que tienen casas de salud asignadas estrategicas
 clues_con_casas = estrat_con_clues.groupby('CLUES_ASIGNADA').agg(
     n_casas=('ID_TEMP_SUS', 'count'),
     estados=('estado', lambda x: ', '.join(x.unique())),
     pct_descubierta_prom=('pct_descubierta', 'mean'),
-    pct_vulnerable_prom=('pct_vulnerable', 'mean')
+    pct_superpuesto_prom=('pct_superpuesto', 'mean')
 ).sort_values('n_casas', ascending=False).head(20)
 
 # ============================================================
@@ -225,11 +224,11 @@ html = f"""<!DOCTYPE html>
     </style>
 </head>
 <body>
-    <h1>🏥 Reporte: CLUES y Casas de Salud</h1>
-    <p>Análisis de indispensabilidad de CLUES y evaluación de 3,560 casas de salud potenciales.</p>
+    <h1>Reporte: CLUES y Casas de Salud</h1>
+    <p>Analisis de indispensabilidad de CLUES y evaluacion de 3,560 casas de salud potenciales (intersecciones reales v2).</p>
 
     <!-- RESUMEN EJECUTIVO -->
-    <h2>📊 Resumen Ejecutivo</h2>
+    <h2>Resumen Ejecutivo</h2>
     <div class="summary-box">
         <div class="card">
             <div class="number">{len(clues):,}</div>
@@ -253,7 +252,7 @@ html = f"""<!DOCTYPE html>
         </div>
         <div class="card green">
             <div class="number">{(casas_full['tipo']=='estrategica').sum():,}</div>
-            <div class="label">Casas estratégicas</div>
+            <div class="label">Casas estrategicas</div>
         </div>
         <div class="card gray">
             <div class="number">{(casas_full['tipo']=='redundante').sum():,}</div>
@@ -265,20 +264,20 @@ html = f"""<!DOCTYPE html>
         </div>
     </div>
 
-    <!-- SECCIÓN 1: CLUES -->
-    <h2>🔑 1. Análisis de CLUES</h2>
+    <!-- SECCION 1: CLUES -->
+    <h2>1. Analisis de CLUES</h2>
 
     <div class="chart">
-        <img src="data:image/png;base64,{img1}" alt="CLUES por categoría">
+        <img src="data:image/png;base64,{img1}" alt="CLUES por categoria">
     </div>
 
     <div class="chart">
-        <img src="data:image/png;base64,{img2}" alt="CLUES por institución">
+        <img src="data:image/png;base64,{img2}" alt="CLUES por institucion">
     </div>
 
-    <h3>Tabla: CLUES por institución y categoría</h3>
+    <h3>Tabla: CLUES por institucion y categoria</h3>
     <table>
-        <tr><th>Institución</th><th>Clave</th><th>Complementaria</th><th>Ideal Normativo</th><th>Total</th></tr>
+        <tr><th>Institucion</th><th>Clave</th><th>Complementaria</th><th>Ideal Normativo</th><th>Total</th></tr>
 """
 
 for _, row in clues.groupby('institucion')['categoria'].value_counts().unstack(fill_value=0).iterrows():
@@ -290,8 +289,8 @@ for _, row in clues.groupby('institucion')['categoria'].value_counts().unstack(f
 
 html += """    </table>
 
-    <!-- SECCIÓN 2: CASAS DE SALUD -->
-    <h2>🏠 2. Análisis de Casas de Salud</h2>
+    <!-- SECCION 2: CASAS DE SALUD -->
+    <h2>2. Analisis de Casas de Salud (Interseccion Real v2)</h2>
 
     <div class="chart">
         <img src="data:image/png;base64,{img3}" alt="Casas de salud por tipo">
@@ -299,26 +298,28 @@ html += """    </table>
 
     <h3>Tabla: Resumen por tipo</h3>
     <table>
-        <tr><th>Tipo</th><th>Cantidad</th><th>%</th><th>Celdas cubiertas</th><th>Celdas descubiertas</th><th>Celdas vulnerables</th></tr>
+        <tr><th>Tipo</th><th>Cantidad</th><th>%</th><th>Area total (km2)</th><th>Area descubierta (km2)</th><th>Area superpuesta (km2)</th></tr>
 """.format(img3=img3)
 
-for tipo in ['estrategica', 'redundante']:
+for tipo in ['estrategica', 'redundante', 'intermedia']:
     subset = casas_full[casas_full['tipo'] == tipo]
+    if len(subset) == 0:
+        continue
     n = len(subset)
     pct = n / len(casas_full) * 100
-    celdas = subset['total_celdas'].sum()
-    desc = subset['celdas_descubiertas'].sum()
-    vuln = subset['celdas_vulnerables'].sum()
-    html += f"        <tr><td><b>{tipo}</b></td><td>{n:,}</td><td>{pct:.1f}%</td><td>{celdas:,}</td><td>{desc:,}</td><td>{vuln:,}</td></tr>\n"
+    area_total = subset['area_total_m2'].sum() / 1e6
+    area_desc = subset['area_descubierta_m2'].sum() / 1e6
+    area_sup = subset['area_superpuesta_m2'].sum() / 1e6
+    html += f"        <tr><td><b>{tipo}</b></td><td>{n:,}</td><td>{pct:.1f}%</td><td>{area_total:,.0f}</td><td>{area_desc:,.0f}</td><td>{area_sup:,.0f}</td></tr>\n"
 
 html += f"""    </table>
 
-    <!-- SECCIÓN 3: CASAS CON CLUES ASIGNADA -->
-    <h2>🔗 3. Casas de Salud con CLUES Asignada (n=653)</h2>
+    <!-- SECCION 3: CASAS CON CLUES ASIGNADA -->
+    <h2>3. Casas de Salud con CLUES Asignada (n=653)</h2>
 
     <div class="highlight">
         <b>Hallazgo clave:</b> De las <b>653</b> casas de salud con CLUES asignada,
-        <b>{(con_clues['tipo']=='estrategica').sum()}</b> tienen coordenadas y son estratégicas (aportan cobertura nueva)
+        <b>{(con_clues['tipo']=='estrategica').sum()}</b> tienen coordenadas y son estrategicas (aportan cobertura nueva)
         y <b>{(con_clues['tipo']=='redundante').sum()}</b> tienen coordenadas y son redundantes.
         <i>Nota: 78 casas del cruce no tienen coordenadas en el archivo de casas de salud.</i>
     </div>
@@ -331,36 +332,36 @@ html += f"""    </table>
         <img src="data:image/png;base64,{img5}" alt="Top estados">
     </div>
 
-    <h3>Tabla: Top 20 CLUES con más casas de salud estratégicas asignadas</h3>
+    <h3>Tabla: Top 20 CLUES con mas casas de salud estrategicas asignadas</h3>
     <table>
-        <tr><th>CLUES Asignada</th><th>N° Casas</th><th>Estados</th><th>% Descubierta promedio</th><th>% Vulnerable promedio</th></tr>
+        <tr><th>CLUES Asignada</th><th>N Casas</th><th>Estados</th><th>% Descubierta promedio</th><th>% Superpuesto promedio</th></tr>
 """
 
 for clues_id, row in clues_con_casas.iterrows():
-    html += f"        <tr><td><b>{clues_id}</b></td><td>{int(row['n_casas'])}</td><td>{row['estados']}</td><td>{row['pct_descubierta_prom']:.1f}%</td><td>{row['pct_vulnerable_prom']:.1f}%</td></tr>\n"
+    html += f"        <tr><td><b>{clues_id}</b></td><td>{int(row['n_casas'])}</td><td>{row['estados']}</td><td>{row['pct_descubierta_prom']:.1f}%</td><td>{row['pct_superpuesto_prom']:.1f}%</td></tr>\n"
 
 html += f"""    </table>
 
-    <h3>Tabla completa: Casas estratégicas con CLUES asignada</h3>
+    <h3>Tabla completa: Casas estrategicas con CLUES asignada</h3>
     <table>
-        <tr><th>ID Casa</th><th>CLUES Asignada</th><th>Estado</th><th>Municipio</th><th>% Descubierta</th><th>% Vulnerable</th><th>% Redundante</th></tr>
+        <tr><th>ID Casa</th><th>CLUES Asignada</th><th>Estado</th><th>Municipio</th><th>% Descubierta</th><th>% Superpuesto</th></tr>
 """
 
 for _, row in estrat_con_clues.head(50).iterrows():
-    html += f"        <tr><td>{row['ID_TEMP_SUS']}</td><td><b>{row['CLUES_ASIGNADA']}</b></td><td>{row['estado']}</td><td>{row['MUNICIPIO']}</td><td>{row['pct_descubierta']:.1f}%</td><td>{row['pct_vulnerable']:.1f}%</td><td>{row['pct_redundante']:.1f}%</td></tr>\n"
+    html += f"        <tr><td>{row['ID_TEMP_SUS']}</td><td><b>{row['CLUES_ASIGNADA']}</b></td><td>{row['estado']}</td><td>{row['MUNICIPIO']}</td><td>{row['pct_descubierta']:.1f}%</td><td>{row['pct_superpuesto']:.1f}%</td></tr>\n"
 
 html += """    </table>
 
     <!-- MAPAS -->
-    <h2>🗺️ 4. Mapas Interactivos</h2>
-    <p>Los mapas interactivos están disponibles en los siguientes archivos locales:</p>
+    <h2>4. Mapas Interactivos</h2>
+    <p>Los mapas interactivos estan disponibles en los siguientes archivos locales:</p>
     <ul>
         <li><b>Mapa de CLUES (indispensabilidad):</b> <code>resultados_indispensabilidad/reporte_indispensabilidad.html</code></li>
         <li><b>Mapa de casas de salud:</b> <code>resultados_casas_salud/mapa_casas_salud.html</code></li>
     </ul>
 
     <div class="footer">
-        <p>Reporte generado el 2026-08-31 | Análisis reproducible en <a href="https://github.com/ArGontr/analisis-isocronas-salud">GitHub</a></p>
+        <p>Reporte generado el 2026-08-31 | Analisis reproducible en <a href="https://github.com/ArGontr/analisis-isocronas-salud">GitHub</a></p>
     </div>
 </body>
 </html>
@@ -372,5 +373,5 @@ out_path = 'resultados_reporte/reporte_completo.html'
 with open(out_path, 'w', encoding='utf-8') as f:
     f.write(html)
 
-print(f"\n✅ Reporte completo guardado en: {out_path}")
-print(f"Tamaño: {os.path.getsize(out_path) / 1024:.0f} KB")
+print(f"\nReporte completo guardado en: {out_path}")
+print(f"Tamano: {os.path.getsize(out_path) / 1024:.0f} KB")
